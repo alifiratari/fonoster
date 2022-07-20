@@ -27,6 +27,9 @@ source "$COMMANDS/install.sh"
 source "$COMMANDS/update.sh"
 source "$COMMANDS/stop.sh"
 
+source "$COMMANDS/install-swarm.sh"
+source "$COMMANDS/stop-swarm.sh"
+
 INPUT=$1
 shift
 
@@ -44,6 +47,13 @@ upgrade | update)
 stop)
   stop "$@"
   ;;  
+install-swarm)
+  install-swarm "$@"
+  ;;
+stop-swarm)
+  stop-swarm "$@"
+  ;;  
+
 *)
   error "Unknown command: $COMMAND"
   ;;

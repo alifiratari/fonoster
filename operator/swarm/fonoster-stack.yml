@@ -1,0 +1,600 @@
+version: '3.9'
+x-deploy-policy: &deploy_policy
+  mode: global
+  placement:
+    constraints: [node.labels.fonoster == true]
+    preferences:
+      - spread: node.id
+
+x-api-policy: &api_policy
+  environment:
+    PUBLIC_URL: ${PUBLIC_URL}
+    APISERVER_ENDPOINT: ${AS_HOST}:${HTTP_PORT}
+    ALLOW_INSECURE: ${AS_ALLOW_INSECURE}
+    DS_HOST: ${DS_HOST}
+    DS_PORT: ${DS_PORT}
+    DS_SECRET: ${DS_SECRET}
+    FS_HOST: ${FS_HOST}
+    FS_PORT: ${FS_PORT}
+    FS_USERNAME: ${FS_USERNAME}
+    FS_SECRET: ${FS_SECRET}
+    EVENTS_BROKERS: amqp://${EB_USERNAME}:${EB_SECRET}@${EB_HOST}:${EB_PORT}
+    EVENTS_ENABLED: ${EB_ENABLED}
+    SIPPROXY_HOST: ${SIPPROXY_HOST}
+    SIPPROXY_API_PORT: ${SIPPROXY_API_PORT}
+    SIPPROXY_API_USERNAME: ${SIPPROXY_API_USERNAME}
+    SIPPROXY_API_SECRET: ${SIPPROXY_API_SECRET}
+    GLOBAL_SIP_DOMAIN: ${GLOBAL_SIP_DOMAIN}
+    MS_ARI_INTERNAL_URL: ${MS_ARI_INTERNAL_URL}
+    MS_ENDPOINT: ${MS_ENDPOINT}
+    MS_TRUNK: ${MS_TRUNK}
+    MS_CONTEXT: ${MS_CONTEXT}
+    MS_EXTENSION: ${MS_EXTENSION}
+    MS_ARI_USERNAME: ${MS_ARI_USERNAME}
+    MS_ARI_SECRET: ${MS_ARI_SECRET}
+    LOG_OPT_TAG_PREFIX: ${LOG_OPT_TAG_PREFIX}
+    LOGS_FORMAT: ${LOGS_FORMAT}
+    LOGS_LEVEL: ${LOGS_LEVEL}
+    LOGS_TRANSPORT: ${LOGS_TRANSPORT}
+    LOGS_DRIVER_HOST: ${LOGS_DRIVER_HOST}
+    LOGS_DRIVER_PORT: ${LOGS_DRIVER_PORT}
+    LOGS_AGGREGRATOR_HOST: ${LOGS_AGGREGRATOR_HOST}
+    LOGS_AGGREGRATOR_PORT: ${LOGS_AGGREGRATOR_PORT}
+    COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME}
+    COMPOSE_PROJECT_VERSION: ${COMPOSE_PROJECT_VERSION}
+    AUTH_ACCESS_WHITELIST: ${AUTH_ACCESS_WHITELIST}
+    AUTH_ISS: ${AUTH_ISS}
+    NODE_ENV: ${NODE_ENV}
+    NODE_OPTIONS: ${NODE_OPTIONS}
+    VOICE_URL: ${VOICE_URL}
+    TRACING_ENDPOINT: ${TRACING_ENDPOINT}
+  networks:
+    fonoster:
+  configs:
+    - source: fonoster-config
+      target: /home/fonoster/.fonoster/config:ro
+    - source: fonoster-private-key-config
+      target: /home/fonoster/.fonoster/private_key
+    - source: fonoster-service-env-config
+      target: /home/fonoster/service_envs.json
+  logging:
+    options:
+      tag: ${LOG_OPT_TAG_PREFIX}.${COMPOSE_PROJECT_NAME}.api
+  depends_on:
+    - apiserver
+    
+services:
+  service_creds:
+    image: fonoster/jwthelper:${COMPOSE_PROJECT_VERSION}
+    environment:
+      ENDPOINT: ${AS_HOST}:${HTTP_PORT}
+      ACCESS_KEY_ID: internal
+      ROLE: SERVICE
+      EXPIRATION: 1y
+    configs:
+      - source: fonoster-private-key-config
+        target: /home/fonoster/private_key
+    volumes:
+      - type: bind
+        source: ${CONFIG}/config
+        target: /home/fonoster/config
+    deploy: 
+      <<: *deploy_policy
+
+  user_creds:
+    image: fonoster/jwthelper:${COMPOSE_PROJECT_VERSION}
+    environment:
+      ACCESS_KEY_ID: fonoster
+      ROLE: USER
+      EXPIRATION: 1y
+
+    configs:
+      - source: fonoster-private-key-config
+        target: /home/fonoster/private_key
+    volumes:
+      - type: bind
+        source: ${CONFIG}/user_credentials
+        target: /home/fonoster/config
+    deploy: 
+      <<: *deploy_policy
+
+  server_certs:
+    image: fonoster/certshelper
+    environment: 
+      SUBJECT: localhost
+      CERT_NAME: server
+    volumes:
+      - ${CONFIG}/certs:/certs
+    deploy: 
+      <<: *deploy_policy
+
+  client_certs:
+    image: fonoster/certshelper
+    environment: 
+      SUBJECT: localhost
+      CERT_NAME: client
+    volumes:
+      - ${CONFIG}/certs:/certs
+    deploy: 
+      <<: *deploy_policy
+
+  apply_server_certs:
+    image: fonoster/confighelper
+    volumes:
+      - ${CONFIG}/certs:/config
+    deploy: 
+      <<: *deploy_policy
+
+  apply_client_certs:
+    image: fonoster/confighelper
+    entrypoint: /bin/sh -c "config-client"
+    volumes:
+      - ${CONFIG}/certs:/config
+    deploy: 
+      <<: *deploy_policy
+
+  logsdriver:
+    image: fonoster/fluent-elasticsearch:${COMPOSE_PROJECT_VERSION}
+    configs:
+      - source: fonoster-fluent-config
+        target: /fluentd/etc/fluent.conf
+    logging:
+      driver: "local"
+    networks:
+      fonoster:
+        aliases: 
+          - ${LOGS_DRIVER_HOST}
+    deploy: 
+      <<: *deploy_policy
+
+  logsaggregator:
+    image: fonoster/elasticsearch:${COMPOSE_PROJECT_VERSION}
+    environment:
+      - "discovery.type=single-node"
+    volumes:
+      - fonoster-esdata:/usr/share/elasticsearch/data:rw
+    networks:
+      fonoster:
+        aliases: 
+          - ${LOGS_AGGREGRATOR_HOST}     
+    deploy: 
+      <<: *deploy_policy
+
+  healthcheck:
+    image: fonoster/healthcheck:${COMPOSE_PROJECT_VERSION}
+    ports:
+      - 45679:3000
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+    networks:
+      fonoster:
+    deploy: 
+      <<: *deploy_policy
+      
+  apiserver:
+    image: fonoster/traefik:${COMPOSE_PROJECT_VERSION}
+    command:
+      # - "--log.level=DEBUG"
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - --providers.docker.constraints=Label(`traefik.constraint-label`, `fonoster`)
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.internal.address=:${HTTP_PORT}"
+      - "--entrypoints.websecure.address=:${HTTPS_PORT}"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+    networks:
+      fonoster:
+        aliases: 
+          - ${AS_HOST}
+    deploy: 
+      <<: *deploy_policy
+
+  auth:
+    <<: *api_policy
+    image: fonoster/auth:${COMPOSE_PROJECT_VERSION}
+    volumes:
+      - ${CONFIG}/rbac.json:/home/fonoster/rbac.json  
+    deploy: 
+      <<: *deploy_policy
+      labels:
+        - "traefik.enable=true"
+        - "traefik.constraint-label=fonoster"        
+        - "traefik.http.routers.auth.entrypoints=internal,websecure"
+        - "traefik.http.routers.auth.rule=PathPrefix(`/fonoster.auth.v1beta1`)"
+        - "traefik.http.services.auth.loadbalancer.server.scheme=h2c"
+
+  monitor:
+    image: fonoster/monitor:${COMPOSE_PROJECT_VERSION}
+    <<: *api_policy
+    deploy: 
+      <<: *deploy_policy
+      labels:
+        - "traefik.enable=true"
+        - "traefik.constraint-label=fonoster"        
+        - "traefik.http.routers.monitor.entrypoints=internal,websecure"
+        - "traefik.http.routers.monitor.rule=PathPrefix(`/fonoster.monitor.v1beta1`)"
+        - "traefik.http.services.monitor.loadbalancer.server.scheme=h2c"
+
+  users:
+    image: fonoster/users:${COMPOSE_PROJECT_VERSION}
+    <<: *api_policy
+    deploy: 
+      <<: *deploy_policy
+      labels:
+        - "traefik.enable=true"
+        - "traefik.constraint-label=fonoster"        
+        - "traefik.http.routers.users.entrypoints=internal,websecure"
+        - "traefik.http.routers.users.rule=PathPrefix(`/fonoster.users.v1beta1`)"
+        - "traefik.http.services.users.loadbalancer.server.scheme=h2c"
+
+  projects:
+    image: fonoster/projects:${COMPOSE_PROJECT_VERSION}
+    <<: *api_policy
+    deploy: 
+      <<: *deploy_policy
+      labels:
+        - "traefik.enable=true"
+        - "traefik.constraint-label=fonoster"
+        - "traefik.http.routers.projects.entrypoints=internal,websecure"
+        - "traefik.http.routers.projects.rule=PathPrefix(`/fonoster.projects.v1beta1`)"
+        - "traefik.http.services.projects.loadbalancer.server.scheme=h2c"
+
+  agents:
+    image: fonoster/agents:${COMPOSE_PROJECT_VERSION}
+    <<: *api_policy
+    deploy: 
+      <<: *deploy_policy
+      labels:
+        - "traefik.enable=true"
+        - "traefik.constraint-label=fonoster"
+        - "traefik.http.routers.agents.entrypoints=internal,websecure"
+        - "traefik.http.routers.agents.rule=PathPrefix(`/fonoster.agents.v1beta1`)"
+        - "traefik.http.services.agents.loadbalancer.server.scheme=h2c"
+
+  domains:
+    image: fonoster/domains:${COMPOSE_PROJECT_VERSION}
+    <<: *api_policy
+    deploy: 
+      <<: *deploy_policy
+      labels:
+        - "traefik.enable=true"
+        - "traefik.constraint-label=fonoster"
+        - "traefik.http.routers.domains.entrypoints=internal,websecure"
+        - "traefik.http.routers.domains.rule=PathPrefix(`/fonoster.domains.v1beta1`)"
+        - "traefik.http.services.domains.loadbalancer.server.scheme=h2c"
+
+  numbers:
+    image: fonoster/numbers:${COMPOSE_PROJECT_VERSION}
+    <<: *api_policy
+    deploy: 
+      <<: *deploy_policy
+      labels:
+        - "traefik.enable=true"
+        - "traefik.constraint-label=fonoster"
+        - "traefik.http.routers.numbers.entrypoints=internal,websecure" 
+        - "traefik.http.routers.numbers.rule=PathPrefix(`/fonoster.numbers.v1beta1`)"
+        - "traefik.http.services.numbers.loadbalancer.server.scheme=h2c"
+
+  providers:
+    image: fonoster/providers:${COMPOSE_PROJECT_VERSION}
+    <<: *api_policy
+    deploy: 
+      <<: *deploy_policy
+      labels:
+        - "traefik.enable=true"
+        - "traefik.constraint-label=fonoster"
+        - "traefik.http.routers.providers.entrypoints=internal,websecure"
+        - "traefik.http.routers.providers.rule=PathPrefix(`/fonoster.providers.v1beta1`)"
+        - "traefik.http.services.providers.loadbalancer.server.scheme=h2c"
+
+  storage:
+    image: fonoster/storage:${COMPOSE_PROJECT_VERSION}
+    <<: *api_policy
+    deploy: 
+      <<: *deploy_policy
+      labels:
+        - "traefik.enable=true"
+        - "traefik.constraint-label=fonoster"
+        - "traefik.http.routers.storage.entrypoints=internal,websecure"
+        - "traefik.http.routers.storage.rule=PathPrefix(`/fonoster.storage.v1beta1`)"
+        - "traefik.http.services.storage.loadbalancer.server.scheme=h2c"
+
+  callmanager:
+    image: fonoster/callmanager:${COMPOSE_PROJECT_VERSION}
+    <<: *api_policy
+    deploy: 
+      <<: *deploy_policy
+      labels:
+        - "traefik.enable=true"
+        - "traefik.constraint-label=fonoster"
+        - "traefik.http.routers.callmanager.entrypoints=internal,websecure"    
+        - "traefik.http.routers.callmanager.rule=PathPrefix(`/fonoster.callmanager.v1beta1`)"
+        - "traefik.http.services.callmanager.loadbalancer.server.scheme=h2c"
+
+  sipproxy:
+    image: fonoster/routr:${COMPOSE_PROJECT_VERSION}
+    environment:
+      EXTERN_ADDR: ${DOCKER_HOST_ADDRESS}
+      DATA_SOURCE_PROVIDER: redis_data_provider
+      INITIAL_API_SECRET: ${SIPPROXY_API_SECRET}
+      DATA_SOURCE_PARAMETERS: host=${DS_HOST},port=${DS_PORT},secret=${DS_SECRET}
+      BIND_ADDR: 0.0.0.0
+      RECORD_ROUTE: "true"
+      REGISTRAR_INTF: Internal
+      EX_RTP_ENGINE_ENABLED: "true"
+      EX_RTP_ENGINE_PROTO: http
+      EX_RTP_ENGINE_HOST: ${RTPE_HOST}
+      EX_RTP_ENGINE_PORT: ${RTPE_PORT}
+      # Setting this to true is breaking the routing workflow in Routr
+      EX_CONVERT_TEL_TO_E164: "false"
+    ports:
+      - ${SIPPROXY_SIP_PORTS}:${SIPPROXY_SIP_PORTS}
+      - ${SIPPROXY_SIP_PORT_UDP}:${SIPPROXY_SIP_PORT_UDP}/udp
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost ${SIPPROXY_API_PORT} || exit 1"]
+      interval: 30s
+      timeout: 30s
+      retries: 3
+    logging:
+      options:
+        tag: ${LOG_OPT_TAG_PREFIX}.${COMPOSE_PROJECT_NAME}.sipproxy
+    networks:
+      fonoster:
+        aliases:
+          - ${SIPPROXY_HOST}
+    configs:
+      - source: fonoster-log4j2-config
+        target: /opt/routr/config/log4j2.yml
+    deploy: 
+      <<: *deploy_policy
+
+  datasource:
+    image: fonoster/redis:${COMPOSE_PROJECT_VERSION}
+    command: ['redis-server', '/etc/redis/redis.conf' ]
+    healthcheck:
+      test: ['CMD', 'redis-cli','ping']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      options:
+        tag: ${LOG_OPT_TAG_PREFIX}.${COMPOSE_PROJECT_NAME}.datasource
+    networks:
+      fonoster:
+        aliases: 
+          - ${DS_HOST}
+    configs:
+      - source: fonoster-redis-config
+        target: /etc/redis/redis.conf
+    volumes: 
+      - fonoster-datasource:/data
+    deploy: 
+      <<: *deploy_policy
+
+  fs:
+    image: fonoster/minio:${COMPOSE_PROJECT_VERSION}
+    restart: ${RESTART_POLICY}
+    command: minio server /fonos
+    volumes:
+      - fonoster-data:/fonos
+    environment:
+      MINIO_ACCESS_KEY: ${FS_USERNAME}
+      MINIO_SECRET_KEY: ${FS_SECRET}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    logging:
+      options:
+        tag: ${LOG_OPT_TAG_PREFIX}.${COMPOSE_PROJECT_NAME}.fs
+    networks:
+      fonoster:
+        aliases:
+          - ${FS_HOST}
+    deploy: 
+      <<: *deploy_policy
+          
+  eventsbroker:
+    image: fonoster/rabbitmq:${COMPOSE_PROJECT_VERSION}
+    environment:
+      RABBITMQ_USERNAME: ${EB_USERNAME}
+      RABBITMQ_PASSWORD: ${EB_SECRET}
+      RABBITMQ_NODE_PORT_NUMBER: ${EB_PORT}
+    logging:
+      options:
+        tag: ${LOG_OPT_TAG_PREFIX}.${COMPOSE_PROJECT_NAME}.eventsbroker
+    networks:
+      fonoster:
+        aliases: 
+          - ${EB_HOST}
+    deploy: 
+      <<: *deploy_policy
+
+  #  secrets:
+  #   image: fonoster/vault:${COMPOSE_PROJECT_VERSION}
+  #   entrypoint: vault server -config=/vault/config/vault.json   
+  #   # ports:
+  #     # - "127.0.0.1:8200:8200"
+  #   volumes:
+  #     - ${CONFIG}/file:/vault/file:rw
+  #     - ${CONFIG}/vault.json:/vault/config/vault.json:ro
+  #   cap_add:
+  #     - IPC_LOCK
+  #   networks:
+  #     fonoster:
+
+
+  # secrets_api:
+  #   image: fonoster/secrets:${COMPOSE_PROJECT_VERSION}
+  #   environment:
+  #     VAULT_ADDR: ${SECRETS_URL}
+  #     VAULT_TOKEN: ${SECRETS_TOKEN}
+  #     SECRETS_POLICY: ${SECRETS_POLICY}
+  #   extends:
+  #     file: api-common.yml
+  #     service: common
+  #   labels:
+  #     - "traefik.enable=true"
+  #     - "traefik.http.routers.secrets_api.entrypoints=internal,websecure"
+  #     - "traefik.constraint-label=fonoster"
+  #     - "traefik.http.routers.secrets_api.rule=PathPrefix(`/fonoster.secrets.v1beta1`)"
+  #     - "traefik.http.services.secrets_api.loadbalancer.server.scheme=h2c"         
+
+  tts:
+    image: fonoster/marytts:${COMPOSE_PROJECT_VERSION}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.tts.entrypoints=internal,websecure"
+      - "traefik.constraint-label=fonoster"
+      - "traefik.http.routers.tts.rule=PathPrefix(`/process`)"
+      - "traefik.http.services.tts.loadbalancer.server.port=59125"
+      - "traefik.http.routers.tts.middlewares=session-auth@docker"
+      - "traefik.http.middlewares.session-auth.forwardauth.address=http://auth:3000/session_auth"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${TTS_ENGINE_PORT}"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      fonoster:
+        aliases: 
+          - ${TTS_ENGINE_HOST}
+    logging:
+      options:
+        tag: ${LOG_OPT_TAG_PREFIX}.${COMPOSE_PROJECT_NAME}.tts
+    deploy: 
+      <<: *deploy_policy
+
+  # Before you start this in production you should limit the traffic to port 8080 
+  # to only internal to avoid denial of service on RTPEngine.
+  rtpengine:
+    image: fonoster/rtpengine:${COMPOSE_PROJECT_VERSION}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.constraint-label=fonoster"
+      - "traefik.http.routers.rtpengine.entrypoints=internal,websecure"
+      - "traefik.http.routers.rtpengine.rule=PathPrefix(`/ng`)"
+      - "traefik.http.services.rtpengine.loadbalancer.server.port=8080"
+    # Network hostmode seems to only work in Linux systems
+    network_mode: "host"
+    environment:
+      # This will fail if network_mode != host
+      PUBLIC_IP: ${DOCKER_HOST_ADDRESS}
+      PORT_MIN: ${RTPE_RTP_PORT_START}
+      PORT_MAX: ${RTPE_RTP_PORT_END}
+      LOG_LEVEL: '6'
+    deploy: 
+      <<: *deploy_policy
+
+  mediaserver:
+    image: fonoster/mediaserver:${COMPOSE_PROJECT_VERSION}
+    environment:
+      APISERVER_ENDPOINT: ${AS_HOST}:${HTTP_PORT}
+      ALLOW_INSECURE: ${AS_ALLOW_INSECURE}
+      ARI_EXTERNAL_URL: ${PUBLIC_URL}
+      ARI_INTERNAL_URL: ${MS_ARI_INTERNAL_URL}
+      ARI_USERNAME: ${MS_ARI_USERNAME}
+      ARI_SECRET: ${MS_ARI_SECRET}
+      EXTERN_ADDR: ${DOCKER_HOST_ADDRESS}
+      EXTERN_PORT: ${MS_SIP_PORT}
+      SIPPROXY_HOST: ${DOCKER_HOST_ADDRESS}
+      SIPPROXY_PORT: ${SIPPROXY_SIP_PORT}
+      SIPPROXY_USERNAME: ${SIPPROXY_USERNAME}
+      SIPPROXY_API_HOST: ${SIPPROXY_API_HOST}
+      SIPPROXY_API_USERNAME: ${SIPPROXY_API_USERNAME}
+      SIPPROXY_API_SECRET: ${SIPPROXY_API_SECRET}
+      SIPPROXY_SECRET: ${SIPPROXY_SECRET}
+      RTP_PORT_START: ${MS_RTP_PORT_START}
+      RTP_PORT_END: ${MS_RTP_PORT_END}
+      # Give asterisk a fake localnet to force it to always advertise its public address
+      # Deprecated
+      # LOCALNET: '8.8.8.8'
+    volumes:
+      - fonoster-data:/home/fonoster
+      # TODO: Update image to add user fonoster
+      - ${CONFIG}/config:/root/.fonoster/config:ro
+    logging:
+      options:
+        tag: ${LOG_OPT_TAG_PREFIX}.${COMPOSE_PROJECT_NAME}.mediaserver
+    networks:
+      fonoster:
+    deploy: 
+      <<: *deploy_policy
+      labels:
+        - "traefik.enable=true"
+        - "traefik.constraint-label=fonoster"
+        - "traefik.http.routers.mediaserver.entrypoints=internal,websecure"
+        - "traefik.http.routers.mediaserver.rule=PathPrefix(`/ari/playbacks`) || PathPrefix(`/ari/channels`) || PathPrefix(`/ari/events`)"
+        - "traefik.http.services.mediaserver.loadbalancer.server.port=8088"
+        - "traefik.http.routers.mediaserver.middlewares=basic-auth@docker,session-auth@docker"
+        - "traefik.http.middlewares.session-auth.forwardauth.address=http://auth:3000/session_auth"
+        - "traefik.http.middlewares.basic-auth.headers.customrequestheaders.Authorization=Basic ${MS_ARI_AUTHORIZATION}"
+
+
+  create_buckets:
+    image: minio/mc:latest
+    entrypoint: >
+      /bin/sh -c "
+      set -e;
+      /usr/bin/mc config host add fs http://${FS_HOST}:${FS_PORT} ${FS_USERNAME} ${FS_SECRET};
+      /usr/bin/mc mb fs/funcs;
+      /usr/bin/mc mb fs/public;
+      /usr/bin/mc mb fs/recordings;
+      /usr/bin/mc policy set download fs/public;
+      exit 0;
+      "
+    networks:
+      fonoster:
+    deploy: 
+      <<: *deploy_policy
+    depends_on:
+      - fs
+
+  bootstrap_sipnet:
+    image: fonoster/routr-ctl
+    entrypoint: >
+      /bin/sh -c "
+      set -e;
+      rctl login https://${SIPPROXY_HOST}:${SIPPROXY_API_PORT}/api/v1beta1 -u ${SIPPROXY_API_USERNAME} -p ${SIPPROXY_API_SECRET};
+      rctl create -f /bootstrap.yml;
+      exit 0;
+      "
+    configs:
+      - source: fonoster-bootstrap-config
+        target: /bootstrap.yml
+        read_only: true
+    networks:
+      fonoster:
+    deploy: 
+      <<: *deploy_policy
+    depends_on:
+      - sipproxy
+networks:
+  prod:
+    external: true
+  fonoster:
+
+
+configs:
+  fonoster-config:
+    file: ${CONFIG}/config
+  fonoster-bootstrap-config:
+    file: ${CONFIG}/bootstrap.yml
+  fonoster-private-key-config:
+    file: ${CONFIG}/private_key
+  fonoster-service-env-config:
+    file: ${CONFIG}/service_envs.json
+  fonoster-fluent-config:
+    file: ${CONFIG}/fluent.conf
+  fonoster-log4j2-config:
+    file: ${CONFIG}/log4j2.yml
+  fonoster-redis-config:
+    file: ${CONFIG}/redis.conf
+
+volumes:
+  fonoster-data:
+  fonoster-esdata:
+  fonoster-config: 
+  fonoster-datasource:
