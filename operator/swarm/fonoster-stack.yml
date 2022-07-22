@@ -191,6 +191,7 @@ services:
       - "/var/run/docker.sock:/var/run/docker.sock:ro"
       - "${CONFIG}/letsencrypt:/letsencrypt"
     networks:
+      prod:
       fonoster:
         aliases: 
           - ${AS_HOST}
@@ -401,7 +402,7 @@ services:
       - source: fonoster-redis-config
         target: /etc/redis/redis.conf
     volumes: 
-      - fonoster-datasource:/data
+      - fonoster-datasource-data:/data
     deploy: 
       <<: *deploy_policy
 
